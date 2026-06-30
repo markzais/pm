@@ -11,6 +11,8 @@ export type Column = {
 };
 
 export type BoardData = {
+  id?: string;
+  title?: string;
   columns: Column[];
   cards: Record<string, Card>;
 };

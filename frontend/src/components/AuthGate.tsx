@@ -2,8 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { KanbanBoard } from "@/components/KanbanBoard";
-
-const TOKEN_KEY = "pm-demo-token";
+import { TOKEN_KEY } from "@/lib/api";
 
 export const AuthGate = () => {
   const [user, setUser] = useState<string | null>(null);
