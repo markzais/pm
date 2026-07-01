@@ -5,7 +5,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from backend import db
-from backend.app import app
+from backend.app import app, apply_ai_actions, parse_ai_response
 
 
 @pytest.fixture(autouse=True)
@@ -118,3 +118,66 @@ def test_ai_prompt_returns_response(client):
     assert "response_text" in data
     assert isinstance(data["response_text"], str)
     assert data["response_text"].strip() != ""
+
+
+def test_parse_ai_response_and_apply_actions(client):
+    token = login(client)
+    board_response = client.get("/api/board", headers={"Authorization": f"Bearer {token}"})
+    board = board_response.json()
+    initial_card_count = len(board["cards"])
+    target_column_id = board["columns"][0]["id"]
+
+    payload = {
+        "response_text": "Added a follow-up task and moved the first card.",
+        "actions": [
+            {
+                "action_type": "create",
+                "card": {"title": "Follow-up task", "description": "Prepare launch notes"},
+                "target_column_id": target_column_id,
+                "position": 0,
+            },
+            {
+                "action_type": "move",
+                "card": {"id": board["cards"][0]["id"]},
+                "target_column_id": board["columns"][1]["id"],
+                "position": 0,
+            },
+        ],
+    }
+
+    parsed = parse_ai_response(str(payload).replace("'", '"'))
+    assert parsed["response_text"] == payload["response_text"]
+    assert len(parsed["actions"]) == 2
+
+    user_id = db.get_user_id("user")
+    applied_changes = apply_ai_actions(user_id, parsed["actions"])
+    assert len(applied_changes) == 2
+
+    updated_board = db.get_board_for_user(user_id)
+    assert len(updated_board["cards"]) == initial_card_count + 1
+    assert any(card["title"] == "Follow-up task" for card in updated_board["cards"])
+    moved_card = next(card for card in updated_board["cards"] if card["id"] == board["cards"][0]["id"])
+    assert moved_card["columnId"] == board["columns"][1]["id"]
+
+
+def test_invalid_ai_actions_are_rejected_without_changes(client):
+    token = login(client)
+    board_response = client.get("/api/board", headers={"Authorization": f"Bearer {token}"})
+    board = board_response.json()
+    initial_card_count = len(board["cards"])
+
+    invalid_actions = [
+        {
+            "action_type": "move",
+            "card": {"id": board["cards"][0]["id"]},
+            "target_column_id": 9999,
+            "position": 0,
+        }
+    ]
+
+    user_id = db.get_user_id("user")
+    with pytest.raises(ValueError):
+        apply_ai_actions(user_id, invalid_actions)
+
+    updated_board = db.get_board_for_user(user_id)
+    assert len(updated_board["cards"]) == initial_card_count

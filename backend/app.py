@@ -1,6 +1,7 @@
+import json
 import os
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional, Tuple
 
 import httpx
 from dotenv import load_dotenv
@@ -21,6 +22,7 @@ from backend.db import (
     rename_column,
     update_card,
     verify_user,
+    get_db,
 )
 
 app = FastAPI()
@@ -61,6 +63,200 @@ class AIPromptRequest(BaseModel):
     message: str
 
 
+class AIAction(BaseModel):
+    action_type: str
+    card: Optional[dict] = None
+    target_column_id: Optional[int] = None
+    position: Optional[int] = None
+
+
+def parse_ai_response(raw_text: str) -> dict:
+    candidate = raw_text.strip()
+    if candidate.startswith("```"):
+        candidate = candidate.strip("`")
+        if candidate.startswith("json"):
+            candidate = candidate[4:].strip()
+    try:
+        data = json.loads(candidate)
+    except json.JSONDecodeError:
+        return {"response_text": raw_text.strip(), "actions": []}
+
+    if not isinstance(data, dict):
+        raise ValueError("AI response must be a JSON object")
+
+    response_text = data.get("response_text")
+    if not isinstance(response_text, str) or not response_text.strip():
+        raise ValueError("response_text is required")
+
+    actions = data.get("actions", [])
+    if actions is None:
+        actions = []
+    if not isinstance(actions, list):
+        raise ValueError("actions must be a list")
+
+    normalized_actions = []
+    for action in actions:
+        if not isinstance(action, dict):
+            raise ValueError("each action must be an object")
+        action_type = action.get("action_type")
+        if action_type not in {"create", "update", "move", "delete"}:
+            raise ValueError("unsupported action_type")
+        normalized_actions.append(
+            {
+                "action_type": action_type,
+                "card": action.get("card") if isinstance(action.get("card"), dict) else {},
+                "target_column_id": action.get("target_column_id"),
+                "position": action.get("position"),
+            }
+        )
+
+    return {"response_text": response_text, "actions": normalized_actions}
+
+
+def _ensure_board_access(user_id: int, card_id: Optional[int] = None, column_id: Optional[int] = None) -> dict:
+    board = get_board_for_user(user_id)
+    if board is None:
+        raise ValueError("board not found")
+
+    allowed_columns = {column["id"] for column in board["columns"]}
+    if column_id is not None and column_id not in allowed_columns:
+        raise ValueError("column not found")
+
+    if card_id is not None:
+        card = get_card(card_id)
+        if card is None or card["columnId"] not in allowed_columns:
+            raise ValueError("card not found")
+        return board
+    return board
+
+
+def apply_ai_actions(user_id: int, actions: List[dict]) -> List[dict]:
+    board = get_board_for_user(user_id)
+    if board is None:
+        raise ValueError("board not found")
+
+    allowed_columns = {column["id"] for column in board["columns"]}
+    applied_changes: List[dict] = []
+    conn = get_db()
+
+    try:
+        conn.execute("BEGIN")
+        for action in actions:
+            action_type = action.get("action_type")
+            card_payload = action.get("card") or {}
+            target_column_id = action.get("target_column_id")
+            position = action.get("position")
+
+            if action_type == "create":
+                if target_column_id is None or target_column_id not in allowed_columns:
+                    raise ValueError("invalid target column")
+                title = card_payload.get("title")
+                description = card_payload.get("description") or ""
+                if not isinstance(title, str) or not title.strip():
+                    raise ValueError("card title is required")
+
+                cursor = conn.cursor()
+                cursor.execute("SELECT MAX(position) FROM cards WHERE column_id = ?", (target_column_id,))
+                row = cursor.fetchone()
+                max_position = row[0] if row and row[0] is not None else -1
+                target_position = max(0, min(int(position), max_position + 1)) if position is not None else max_position + 1
+                cursor.execute(
+                    "UPDATE cards SET position = position + 1 WHERE column_id = ? AND position >= ?",
+                    (target_column_id, target_position),
+                )
+                cursor.execute(
+                    "INSERT INTO cards (column_id, title, description, position, metadata) VALUES (?, ?, ?, ?, ?)",
+                    (target_column_id, title, description, target_position, json.dumps({})),
+                )
+                created_id = cursor.lastrowid
+                applied_changes.append({"action_type": "create", "card_id": created_id})
+            elif action_type == "update":
+                card_id = card_payload.get("id")
+                if not isinstance(card_id, int):
+                    raise ValueError("card id is required")
+                _ensure_board_access(user_id, card_id=card_id)
+                title = card_payload.get("title")
+                description = card_payload.get("description")
+                cursor = conn.cursor()
+                cursor.execute(
+                    "UPDATE cards SET title = ?, description = ?, updated_at = datetime('now') WHERE id = ?",
+                    (title if title is not None else None, description, card_id),
+                )
+                applied_changes.append({"action_type": "update", "card_id": card_id})
+            elif action_type == "move":
+                card_id = card_payload.get("id")
+                if not isinstance(card_id, int):
+                    raise ValueError("card id is required")
+                if target_column_id is None or target_column_id not in allowed_columns:
+                    raise ValueError("invalid target column")
+                _ensure_board_access(user_id, card_id=card_id)
+                cursor = conn.cursor()
+                cursor.execute("SELECT column_id, position FROM cards WHERE id = ?", (card_id,))
+                row = cursor.fetchone()
+                if row is None:
+                    raise ValueError("card not found")
+                current_column_id, current_position = row[0], row[1]
+                destination = max(0, min(int(position if position is not None else 0), 999999))
+                cursor.execute("SELECT MAX(position) FROM cards WHERE column_id = ?", (target_column_id,))
+                target_row = cursor.fetchone()
+                max_target_position = target_row[0] if target_row and target_row[0] is not None else -1
+                destination = max(0, min(destination, max_target_position + 1))
+
+                if current_column_id == target_column_id:
+                    if destination == current_position:
+                        continue
+                    if destination > current_position:
+                        cursor.execute(
+                            "UPDATE cards SET position = position - 1 WHERE column_id = ? AND position > ? AND position <= ?",
+                            (target_column_id, current_position, destination),
+                        )
+                    else:
+                        cursor.execute(
+                            "UPDATE cards SET position = position + 1 WHERE column_id = ? AND position >= ? AND position < ?",
+                            (target_column_id, destination, current_position),
+                        )
+                    cursor.execute("UPDATE cards SET position = ? WHERE id = ?", (destination, card_id))
+                else:
+                    cursor.execute(
+                        "UPDATE cards SET position = position - 1 WHERE column_id = ? AND position > ?",
+                        (current_column_id, current_position),
+                    )
+                    cursor.execute(
+                        "UPDATE cards SET position = position + 1 WHERE column_id = ? AND position >= ?",
+                        (target_column_id, destination),
+                    )
+                    cursor.execute(
+                        "UPDATE cards SET column_id = ?, position = ? WHERE id = ?",
+                        (target_column_id, destination, card_id),
+                    )
+                applied_changes.append({"action_type": "move", "card_id": card_id})
+            elif action_type == "delete":
+                card_id = card_payload.get("id")
+                if not isinstance(card_id, int):
+                    raise ValueError("card id is required")
+                _ensure_board_access(user_id, card_id=card_id)
+                cursor = conn.cursor()
+                cursor.execute("SELECT column_id, position FROM cards WHERE id = ?", (card_id,))
+                row = cursor.fetchone()
+                if row is None:
+                    raise ValueError("card not found")
+                column_id, position = row[0], row[1]
+                cursor.execute(
+                    "UPDATE cards SET position = position - 1 WHERE column_id = ? AND position > ?",
+                    (column_id, position),
+                )
+                cursor.execute("DELETE FROM cards WHERE id = ?", (card_id,))
+                applied_changes.append({"action_type": "delete", "card_id": card_id})
+            else:
+                raise ValueError("unsupported action_type")
+
+        conn.commit()
+        return applied_changes
+    except Exception:
+        conn.rollback()
+        raise
+
+
 def _format_board_context(board: dict) -> str:
     lines = [f"Board: {board['title']}"]
     for column in board["columns"]:
@@ -76,7 +272,7 @@ async def call_openrouter(message: str, board: dict) -> str:
     if not api_key:
         raise HTTPException(status_code=500, detail="OPENROUTER_API_KEY not configured")
 
-    endpoint = "https://openrouter.ai/v1/chat/completions"
+    endpoint = "https://openrouter.ai/api/v1/chat/completions"
     payload = {
         "model": "openai/gpt-oss-120b",
         "messages": [
@@ -183,8 +379,18 @@ async def ai_prompt(request: AIPromptRequest, user_id: int = Depends(get_current
         raise HTTPException(status_code=404, detail="board not found")
     if not request.message.strip():
         raise HTTPException(status_code=400, detail="message is required")
-    response_text = await call_openrouter(request.message, board)
-    return {"response_text": response_text}
+
+    try:
+        response_text = await call_openrouter(request.message, board)
+        parsed = parse_ai_response(response_text)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    applied_changes = []
+    if parsed.get("actions"):
+        applied_changes = apply_ai_actions(user_id, parsed["actions"])
+
+    return {"response_text": parsed["response_text"], "actions": applied_changes}
 
 
 @app.post("/api/cards")
