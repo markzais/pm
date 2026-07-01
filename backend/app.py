@@ -1,6 +1,9 @@
+import os
 from pathlib import Path
 from typing import Dict, Optional
 
+import httpx
+from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -21,6 +24,7 @@ from backend.db import (
 )
 
 app = FastAPI()
+load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
 FRONTEND_BUILD_DIR = Path(__file__).resolve().parents[1] / "frontend" / "out"
 
@@ -51,6 +55,70 @@ class MoveCardRequest(BaseModel):
 
 class RenameColumnRequest(BaseModel):
     title: str
+
+
+class AIPromptRequest(BaseModel):
+    message: str
+
+
+def _format_board_context(board: dict) -> str:
+    lines = [f"Board: {board['title']}"]
+    for column in board["columns"]:
+        lines.append(f"Column: {column['title']} ({len(column['cardIds'])} cards)")
+        for card in board["cards"]:
+            if card["columnId"] == column["id"]:
+                lines.append(f"- {card['title']}: {card['description']}")
+    return "\n".join(lines)
+
+
+async def call_openrouter(message: str, board: dict) -> str:
+    api_key = os.getenv("OPENROUTER_API_KEY")
+    if not api_key:
+        raise HTTPException(status_code=500, detail="OPENROUTER_API_KEY not configured")
+
+    endpoint = "https://openrouter.ai/v1/chat/completions"
+    payload = {
+        "model": "openai/gpt-oss-120b",
+        "messages": [
+            {"role": "system", "content": "You are an AI assistant that helps manage a kanban board."},
+            {"role": "system", "content": _format_board_context(board)},
+            {"role": "user", "content": message},
+        ],
+        "temperature": 0.2,
+        "max_tokens": 512,
+    }
+    headers = {"Authorization": f"Bearer {api_key}"}
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.post(endpoint, json=payload, headers=headers)
+
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"OpenRouter returned {exc.response.status_code}: {exc.response.text}",
+        ) from exc
+
+    try:
+        data = response.json()
+    except ValueError as exc:
+        raise HTTPException(status_code=502, detail="Invalid JSON from OpenRouter") from exc
+
+    choices = data.get("choices")
+    if not choices or not isinstance(choices, list):
+        raise HTTPException(status_code=502, detail="Unexpected OpenRouter response format")
+
+    first_choice = choices[0]
+    message_obj = first_choice.get("message") if isinstance(first_choice, dict) else None
+    if not isinstance(message_obj, dict):
+        raise HTTPException(status_code=502, detail="OpenRouter response missing message")
+
+    content = message_obj.get("content")
+    if not isinstance(content, str):
+        raise HTTPException(status_code=502, detail="OpenRouter response missing content")
+
+    return content.strip()
 
 
 def get_current_user_id(authorization: str = Header(default=None)) -> int:
@@ -106,6 +174,17 @@ async def get_board(user_id: int = Depends(get_current_user_id)):
     if board is None:
         raise HTTPException(status_code=404, detail="board not found")
     return board
+
+
+@app.post("/api/ai/prompt")
+async def ai_prompt(request: AIPromptRequest, user_id: int = Depends(get_current_user_id)):
+    board = get_board_for_user(user_id)
+    if board is None:
+        raise HTTPException(status_code=404, detail="board not found")
+    if not request.message.strip():
+        raise HTTPException(status_code=400, detail="message is required")
+    response_text = await call_openrouter(request.message, board)
+    return {"response_text": response_text}
 
 
 @app.post("/api/cards")

@@ -1,3 +1,4 @@
+import os
 import sqlite3
 
 import pytest
@@ -99,3 +100,21 @@ def test_rename_column(client):
     )
     assert rename_response.status_code == 200
     assert rename_response.json()["status"] == "ok"
+
+
+@pytest.mark.skipif(
+    not os.getenv("OPENROUTER_API_KEY"),
+    reason="OPENROUTER_API_KEY is not configured in environment",
+)
+def test_ai_prompt_returns_response(client):
+    token = login(client)
+    prompt_response = client.post(
+        "/api/ai/prompt",
+        json={"message": "What is 2+2?"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert prompt_response.status_code == 200
+    data = prompt_response.json()
+    assert "response_text" in data
+    assert isinstance(data["response_text"], str)
+    assert data["response_text"].strip() != ""
