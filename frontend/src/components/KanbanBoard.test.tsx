@@ -151,6 +151,18 @@ const createFetchMock = () => {
       );
     }
 
+    if (url.endsWith("/api/ai/prompt") && init?.method === "POST") {
+      return Promise.resolve(
+        new Response(
+          JSON.stringify({
+            response_text: "Moved the card to the next phase.",
+            actions: [{ action_type: "move", card_id: 1 }],
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } }
+        )
+      );
+    }
+
     return Promise.resolve(new Response(null, { status: 404 }));
   });
   vi.stubGlobal("fetch", mockedFetch);
@@ -205,5 +217,18 @@ describe("KanbanBoard", () => {
     });
     await userEvent.click(deleteButton);
     await waitFor(() => expect(within(column).queryByText("New card")).not.toBeInTheDocument());
+  });
+
+  it("sends an AI prompt and displays assistant response", async () => {
+    render(<KanbanBoard />);
+    await waitForRemoteBoard();
+
+    const promptInput = screen.getByPlaceholderText(/Ask the AI to update the board/i);
+    await userEvent.type(promptInput, "Move the first card to review.");
+
+    const sendButton = screen.getByRole("button", { name: /send/i });
+    await userEvent.click(sendButton);
+
+    await waitFor(() => expect(screen.getByText("Moved the card to the next phase.")).toBeInTheDocument());
   });
 });

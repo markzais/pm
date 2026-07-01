@@ -153,3 +153,21 @@ export const renameColumnApi = async (columnId: string, title: string) => {
     throw new Error("Unable to rename column");
   }
 };
+
+export type AiPromptResponse = {
+  response_text: string;
+  actions?: Array<{ action_type: string; card_id: number }>;
+};
+
+export const promptAiApi = async (message: string): Promise<AiPromptResponse> => {
+  const response = await fetch(getFetchUrl("/api/ai/prompt"), {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...getAuthHeaders() },
+    body: JSON.stringify({ message }),
+  });
+  if (!response.ok) {
+    const body = await response.text();
+    throw new Error(`Unable to send AI prompt: ${body}`);
+  }
+  return response.json();
+};

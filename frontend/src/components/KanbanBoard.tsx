@@ -13,6 +13,7 @@ import {
 } from "@dnd-kit/core";
 import { KanbanColumn } from "@/components/KanbanColumn";
 import { KanbanCardPreview } from "@/components/KanbanCardPreview";
+import { ChatSidebar } from "@/components/ChatSidebar";
 import { initialData, moveCard, type BoardData } from "@/lib/kanban";
 import {
   fetchBoard,
@@ -20,6 +21,7 @@ import {
   deleteCardApi,
   moveCardApi,
   renameColumnApi,
+  promptAiApi,
 } from "@/lib/api";
 
 export const KanbanBoard = () => {
@@ -27,6 +29,12 @@ export const KanbanBoard = () => {
   const [activeCardId, setActiveCardId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [chatMessages, setChatMessages] = useState<
+    Array<{ sender: "user" | "assistant"; text: string }>
+  >([]);
+  const [chatInput, setChatInput] = useState("");
+  const [chatStatus, setChatStatus] = useState<string | null>(null);
+  const [chatPending, setChatPending] = useState(false);
 
   const sensors = useSensors(
     useSensor(PointerSensor, {
@@ -156,6 +164,35 @@ export const KanbanBoard = () => {
     }
   };
 
+  const handleSendChat = async (message: string) => {
+    setChatMessages((prev) => [...prev, { sender: "user", text: message }]);
+    setChatInput("");
+    setChatPending(true);
+    setChatStatus("Sending AI request...");
+
+    try {
+      const response = await promptAiApi(message);
+      setChatMessages((prev) => [
+        ...prev,
+        { sender: "assistant", text: response.response_text },
+      ]);
+      setChatStatus(response.actions?.length ? "Board updated" : "Response received");
+
+      if (response.actions?.length) {
+        const refreshedBoard = await fetchBoard();
+        if (refreshedBoard) {
+          setBoard(refreshedBoard);
+        }
+      }
+    } catch (err) {
+      console.error("Unable to send AI prompt", err);
+      setError(err instanceof Error ? err.message : "Unable to send AI prompt.");
+      setChatStatus(null);
+    } finally {
+      setChatPending(false);
+    }
+  };
+
   const activeCard = activeCardId ? cardsById[activeCardId] : null;
 
   if (error) {
@@ -208,32 +245,43 @@ export const KanbanBoard = () => {
           </div>
         </header>
 
-        <DndContext
-          sensors={sensors}
-          collisionDetection={closestCorners}
-          onDragStart={handleDragStart}
-          onDragEnd={handleDragEnd}
-        >
-          <section className="grid gap-6 lg:grid-cols-5">
-            {board.columns.map((column) => (
-              <KanbanColumn
-                key={column.id}
-                column={column}
-                cards={column.cardIds.map((cardId) => board.cards[cardId])}
-                onRename={handleRenameColumn}
-                onAddCard={handleAddCard}
-                onDeleteCard={handleDeleteCard}
-              />
-            ))}
-          </section>
-          <DragOverlay>
-            {activeCard ? (
-              <div className="w-[260px]">
-                <KanbanCardPreview card={activeCard} />
-              </div>
-            ) : null}
-          </DragOverlay>
-        </DndContext>
+        <div className="grid gap-6 xl:grid-cols-[minmax(0,1fr)_420px]">
+          <DndContext
+            sensors={sensors}
+            collisionDetection={closestCorners}
+            onDragStart={handleDragStart}
+            onDragEnd={handleDragEnd}
+          >
+            <section className="grid gap-6 lg:grid-cols-5">
+              {board.columns.map((column) => (
+                <KanbanColumn
+                  key={column.id}
+                  column={column}
+                  cards={column.cardIds.map((cardId) => board.cards[cardId])}
+                  onRename={handleRenameColumn}
+                  onAddCard={handleAddCard}
+                  onDeleteCard={handleDeleteCard}
+                />
+              ))}
+            </section>
+            <DragOverlay>
+              {activeCard ? (
+                <div className="w-[260px]">
+                  <KanbanCardPreview card={activeCard} />
+                </div>
+              ) : null}
+            </DragOverlay>
+          </DndContext>
+
+          <ChatSidebar
+            messages={chatMessages}
+            value={chatInput}
+            onChange={setChatInput}
+            onSend={handleSendChat}
+            disabled={chatPending}
+            status={chatStatus}
+          />
+        </div>
       </main>
     </div>
   );
